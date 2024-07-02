@@ -21,15 +21,23 @@ import (
 	"crypto/tls"
 	"errors"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/gravitational/teleport"
-	vnetproto "github.com/gravitational/teleport/api/gen/proto/go/teleport/vnet/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils"
+	prehogv1alpha "github.com/gravitational/teleport/gen/proto/go/prehog/v1alpha"
+	apiteleterm "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
 	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/vnet/v1"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/teleterm/api/uri"
+	"github.com/gravitational/teleport/lib/teleterm/clusteridcache"
+	"github.com/gravitational/teleport/lib/teleterm/clusters"
 	"github.com/gravitational/teleport/lib/teleterm/daemon"
 	logutils "github.com/gravitational/teleport/lib/utils/log"
 	"github.com/gravitational/teleport/lib/vnet"
@@ -49,10 +57,12 @@ const (
 type Service struct {
 	api.UnimplementedVnetServiceServer
 
-	cfg            Config
-	mu             sync.Mutex
-	status         status
-	processManager *vnet.ProcessManager
+	cfg                Config
+	mu                 sync.Mutex
+	status             status
+	usageReporter      usageReporter
+	processManager     *vnet.ProcessManager
+	clusterConfigCache *vnet.ClusterConfigCache
 }
 
 // New creates an instance of Service.
@@ -67,14 +77,36 @@ func New(cfg Config) (*Service, error) {
 }
 
 type Config struct {
-	DaemonService      *daemon.Service
+	// DaemonService is used to get cached clients and for usage reporting. If DaemonService was not
+	// one giant blob of methods, Config could accept two separate services instead.
+	DaemonService *daemon.Service
+	// InsecureSkipVerify signifies whether VNet is going to verify the identity of the proxy service.
 	InsecureSkipVerify bool
+	// ClusterIDCache is used for usage reporting to read cluster ID that needs to be included with
+	// every event.
+	ClusterIDCache *clusteridcache.Cache
+	// InstallationID is a unique ID of this particular Connect installation, used for usage
+	// reporting.
+	InstallationID string
+	Clock          clockwork.Clock
 }
 
 // CheckAndSetDefaults checks and sets the defaults
 func (c *Config) CheckAndSetDefaults() error {
 	if c.DaemonService == nil {
 		return trace.BadParameter("missing DaemonService")
+	}
+
+	if c.ClusterIDCache == nil {
+		return trace.BadParameter("missing ClusterIDCache")
+	}
+
+	if c.InstallationID == "" {
+		return trace.BadParameter("missing InstallationID")
+	}
+
+	if c.Clock == nil {
+		c.Clock = clockwork.NewRealClock()
 	}
 
 	return nil
@@ -89,15 +121,48 @@ func (s *Service) Start(ctx context.Context, req *api.StartRequest) (*api.StartR
 	}
 
 	if s.status == statusRunning {
-		return &api.StartResponse{}, nil
+		return nil, trace.AlreadyExists("VNet is already running")
 	}
 
 	appProvider := &appProvider{
 		daemonService:      s.cfg.DaemonService,
 		insecureSkipVerify: s.cfg.InsecureSkipVerify,
+		usageReporter:      &disabledTelemetryUsageReporter{},
 	}
 
-	processManager, err := vnet.SetupAndRun(ctx, appProvider)
+	// Generally, the usage reporting setting cannot be changed without restarting the app, so
+	// technically this information could have been passed through argv to tsh daemon.
+	// However, there is one exception: during the first launch of the app, the user is asked if they
+	// want to enable telemetry. Agreeing to that changes the setting without restarting the app.
+	// As such, this service needs to ask for this setting on every launch.
+	isUsageReportingEnabled, err := s.isUsageReportingEnabled(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err, "getting usage reporting settings")
+	}
+
+	if isUsageReportingEnabled {
+		usageReporter, err := newDaemonUsageReporter(daemonUsageReporterConfig{
+			ClientCache:    s.cfg.DaemonService,
+			EventConsumer:  s.cfg.DaemonService,
+			ClusterIDCache: s.cfg.ClusterIDCache,
+			InstallationID: s.cfg.InstallationID,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		defer func() {
+			if s.status != statusRunning {
+				usageReporter.Stop()
+			}
+		}()
+		appProvider.usageReporter = usageReporter
+	}
+
+	s.clusterConfigCache = vnet.NewClusterConfigCache(s.cfg.Clock)
+	processManager, err := vnet.SetupAndRun(ctx, &vnet.SetupAndRunConfig{
+		AppProvider:        appProvider,
+		ClusterConfigCache: s.clusterConfigCache,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -110,19 +175,27 @@ func (s *Service) Start(ctx context.Context, req *api.StartRequest) (*api.StartR
 			log.DebugContext(ctx, "VNet closed")
 		}
 
-		// TODO(ravicious): Notify the Electron app about change of VNet state, but only if it's
-		// running. If it's not running, then the Start RPC has already failed and forwarded the error
-		// to the user.
-
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
+		// Handle unexpected shutdown.
+		// If processManager.Wait has returned but status is stil "running", then it means that VNet
+		// unexpectedly shut down rather than stopped through the Stop RPC.
 		if s.status == statusRunning {
 			s.status = statusNotRunning
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			reportErr := s.reportUnexpectedShutdown(ctx, err)
+			if reportErr != nil {
+				log.ErrorContext(ctx, "Could not notify the Electron app about unexpected VNet shutdown",
+					"shutdown_error", err, "notify_error", reportErr)
+			}
 		}
 	}()
 
 	s.processManager = processManager
+	s.usageReporter = appProvider.usageReporter
 	s.status = statusRunning
 	return &api.StartResponse{}, nil
 }
@@ -140,6 +213,81 @@ func (s *Service) Stop(ctx context.Context, req *api.StopRequest) (*api.StopResp
 	return &api.StopResponse{}, nil
 }
 
+// ListDNSZones returns DNS zones of all root and leaf clusters with non-expired user certs. This
+// includes the proxy service hostnames and custom DNS zones configured in vnet_config.
+//
+// This is fetched independently of what the Electron app thinks the current state of the cluster
+// looks like, since the VNet admin process also fetches this data independently of the Electron
+// app.
+//
+// Just like the admin process, it skips root and leaf clusters for which DNS couldn't be fetched
+// (due to e.g., a network error or an expired cert).
+func (s *Service) ListDNSZones(ctx context.Context, req *api.ListDNSZonesRequest) (*api.ListDNSZonesResponse, error) {
+	// Acquire the lock just to check the status of the service. We don't want the actual process of
+	// listing DNS zones to block the user from performing other operations.
+	s.mu.Lock()
+
+	if s.status != statusRunning {
+		return nil, trace.CompareFailed("VNet is not running")
+	}
+
+	defer s.mu.Unlock()
+
+	profileNames, err := s.cfg.DaemonService.ListProfileNames()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	dnsZones := []string{}
+
+	for _, profileName := range profileNames {
+		rootClusterURI := uri.NewClusterURI(profileName)
+		cLog := log.With("cluster", rootClusterURI)
+
+		rootClient, err := s.cfg.DaemonService.GetCachedClient(ctx, rootClusterURI)
+		if err != nil {
+			cLog.WarnContext(ctx, "Failed to create root cluster client, profile may be expired, skipping DNS zones of this cluster", "error", err)
+			continue
+		}
+		clusterConfig, err := s.clusterConfigCache.GetClusterConfig(ctx, rootClient)
+		if err != nil {
+			cLog.WarnContext(ctx, "Failed to load VNet configuration, profile may be expired, skipping DNS zones of this cluster", "error", err)
+			continue
+		}
+
+		dnsZones = append(dnsZones, clusterConfig.DNSZones...)
+
+		leafClusters, err := s.cfg.DaemonService.ListLeafClusters(ctx, rootClusterURI.String())
+		if err != nil {
+			cLog.WarnContext(ctx, "Failed to list leaf clusters, profile may be expired, skipping DNS zones from leaf clusters of this cluster", "error", err)
+			continue
+		}
+
+		for _, leafCluster := range leafClusters {
+			cLog := log.With("cluster", leafCluster.URI.String())
+
+			clusterClient, err := s.cfg.DaemonService.GetCachedClient(ctx, leafCluster.URI)
+			if err != nil {
+				cLog.WarnContext(ctx, "Failed to create leaf cluster client, skipping DNS zones for this leaf cluster", "error", err)
+				continue
+			}
+			clusterConfig, err := s.clusterConfigCache.GetClusterConfig(ctx, clusterClient)
+			if err != nil {
+				cLog.WarnContext(ctx, "Failed to load VNet configuration, skipping DNS zones for this leaf cluster", "error", err)
+				continue
+			}
+
+			dnsZones = append(dnsZones, clusterConfig.DNSZones...)
+		}
+	}
+
+	dnsZones = utils.Deduplicate(dnsZones)
+
+	return &api.ListDNSZonesResponse{
+		DnsZones: dnsZones,
+	}, nil
+}
+
 func (s *Service) stopLocked() error {
 	if s.status == statusClosed {
 		return trace.CompareFailed("VNet service has been closed")
@@ -154,6 +302,7 @@ func (s *Service) stopLocked() error {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return trace.Wrap(err)
 	}
+	s.usageReporter.Stop()
 
 	s.status = statusNotRunning
 	return nil
@@ -174,8 +323,40 @@ func (s *Service) Close() error {
 	return nil
 }
 
+func (s *Service) isUsageReportingEnabled(ctx context.Context) (bool, error) {
+	tshdEventsClient, err := s.cfg.DaemonService.TshdEventsClient()
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	resp, err := tshdEventsClient.GetUsageReportingSettings(ctx, &apiteleterm.GetUsageReportingSettingsRequest{})
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	return resp.UsageReportingSettings.Enabled, nil
+}
+
+func (s *Service) reportUnexpectedShutdown(ctx context.Context, shutdownErr error) error {
+	tshdEventsClient, err := s.cfg.DaemonService.TshdEventsClient()
+	if err != nil {
+		return trace.Wrap(err, "obtaining tshd events client")
+	}
+
+	var shutdownErrorMsg string
+	if shutdownErr != nil {
+		shutdownErrorMsg = shutdownErr.Error()
+	}
+
+	_, err = tshdEventsClient.ReportUnexpectedVnetShutdown(ctx, &apiteleterm.ReportUnexpectedVnetShutdownRequest{
+		Error: shutdownErrorMsg,
+	})
+	return trace.Wrap(err, "sending shutdown report")
+}
+
 type appProvider struct {
 	daemonService      *daemon.Service
+	usageReporter      usageReporter
 	insecureSkipVerify bool
 }
 
@@ -184,7 +365,11 @@ func (p *appProvider) ListProfiles() ([]string, error) {
 	return profiles, trace.Wrap(err)
 }
 
-func (p *appProvider) GetCachedClient(ctx context.Context, profileName, leafClusterName string) (*client.ClusterClient, error) {
+func (p *appProvider) GetCachedClient(ctx context.Context, profileName, leafClusterName string) (vnet.ClusterClient, error) {
+	return p.getCachedClient(ctx, profileName, leafClusterName)
+}
+
+func (p *appProvider) getCachedClient(ctx context.Context, profileName, leafClusterName string) (*client.ClusterClient, error) {
 	uri := uri.NewClusterURI(profileName).AppendLeafCluster(leafClusterName)
 	client, err := p.daemonService.GetCachedClient(ctx, uri)
 	return client, trace.Wrap(err)
@@ -192,19 +377,54 @@ func (p *appProvider) GetCachedClient(ctx context.Context, profileName, leafClus
 
 func (p *appProvider) ReissueAppCert(ctx context.Context, profileName, leafClusterName string, app types.Application) (tls.Certificate, error) {
 	clusterURI := uri.NewClusterURI(profileName).AppendLeafCluster(leafClusterName)
-	cluster, _, err := p.daemonService.ResolveClusterURI(clusterURI)
-	if err != nil {
+	appURI := clusterURI.AppendApp(app.GetName())
+
+	reloginReq := &apiteleterm.ReloginRequest{
+		RootClusterUri: clusterURI.GetRootClusterURI().String(),
+		Reason: &apiteleterm.ReloginRequest_VnetCertExpired{
+			VnetCertExpired: &apiteleterm.VnetCertExpired{
+				TargetUri:  appURI.String(),
+				PublicAddr: app.GetPublicAddr(),
+			},
+		},
+	}
+
+	var cert tls.Certificate
+
+	reissueCert := func() error {
+		cluster, _, err := p.daemonService.ResolveClusterURI(clusterURI)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		client, err := p.daemonService.GetCachedClient(ctx, clusterURI)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		cert, err = cluster.ReissueAppCert(ctx, client, app)
+		return trace.Wrap(err)
+	}
+
+	if err := p.daemonService.RetryWithRelogin(ctx, reloginReq, reissueCert); err != nil {
+		notifyErr := p.daemonService.NotifyApp(ctx, &apiteleterm.SendNotificationRequest{
+			Subject: &apiteleterm.SendNotificationRequest_CannotProxyVnetConnection{
+				CannotProxyVnetConnection: &apiteleterm.CannotProxyVnetConnection{
+					TargetUri:  appURI.String(),
+					PublicAddr: app.GetPublicAddr(),
+					Error:      err.Error(),
+				},
+			},
+		})
+		if notifyErr != nil {
+			log.ErrorContext(ctx, "Failed to send a notification for an error encountered during VNet cert reissue",
+				"cert_reissue_error", err, "notify_error", notifyErr)
+		}
+
 		return tls.Certificate{}, trace.Wrap(err)
 	}
 
-	client, err := p.daemonService.GetCachedClient(ctx, clusterURI)
-	if err != nil {
-		return tls.Certificate{}, trace.Wrap(err)
-	}
-
-	// TODO(ravicious): Copy stuff from DaemonService.reissueGatewayCerts in order to handle expired certs.
-	cert, err := cluster.ReissueAppCert(ctx, client, app)
-	return cert, trace.Wrap(err)
+	return cert, nil
 }
 
 // GetDialOptions returns ALPN dial options for the profile.
@@ -228,12 +448,187 @@ func (p *appProvider) GetDialOptions(ctx context.Context, profileName string) (*
 	return dialOpts, nil
 }
 
-func (p *appProvider) GetVnetConfig(ctx context.Context, profileName, leafClusterName string) (*vnetproto.VnetConfig, error) {
-	clusterClient, err := p.GetCachedClient(ctx, profileName, leafClusterName)
-	if err != nil {
+// OnNewConnection submits a usage event once per appProvider lifetime.
+// That is, if a user makes multiple connections to a single app, OnNewConnection submits a single
+// event. This is to mimic how Connect submits events for its app gateways. This lets us compare
+// popularity of VNet and app gateways.
+func (p *appProvider) OnNewConnection(ctx context.Context, profileName, leafClusterName string, app types.Application) error {
+	// Enqueue the event from a separate goroutine since we don't care about errors anyway and we also
+	// don't want to slow down VNet connections.
+	go func() {
+		uri := uri.NewClusterURI(profileName).AppendLeafCluster(leafClusterName).AppendApp(app.GetName())
+
+		// Not passing ctx to ReportApp since ctx is tied to the lifetime of the connection.
+		// If it's a short-lived connection, inheriting its context would interrupt reporting.
+		err := p.usageReporter.ReportApp(uri)
+		if err != nil {
+			log.ErrorContext(ctx, "Failed to submit usage event", "app", uri, "error", err)
+		}
+	}()
+
+	return nil
+}
+
+type usageReporter interface {
+	ReportApp(uri.ResourceURI) error
+	Stop()
+}
+
+type daemonUsageReporter struct {
+	cfg daemonUsageReporterConfig
+	// reportedApps contains a set of URIs for apps which usage has been already reported.
+	// App gateways (local proxies) in Connect report a single event per gateway created per app. VNet
+	// needs to replicate this behavior, hence why it keeps track of reported apps to report only one
+	// event per app per VNet's lifespan.
+	reportedApps map[string]struct{}
+	// mu protects access to reportedApps.
+	mu sync.Mutex
+	// close is used to abort a ReportApp call that's currently in flight.
+	close chan struct{}
+	// closed signals that usageReporter has been stopped and no more events should be reported.
+	closed atomic.Bool
+}
+
+type clientCache interface {
+	GetCachedClient(context.Context, uri.ResourceURI) (*client.ClusterClient, error)
+	ResolveClusterURI(uri uri.ResourceURI) (*clusters.Cluster, *client.TeleportClient, error)
+}
+
+type eventConsumer interface {
+	ReportUsageEvent(*apiteleterm.ReportUsageEventRequest) error
+}
+
+type daemonUsageReporterConfig struct {
+	ClientCache   clientCache
+	EventConsumer eventConsumer
+	// clusterIDCache stores cluster ID that needs to be included with each usage event. It's updated
+	// outside of usageReporter – the middleware merely reads data from it. If the cache does not
+	// contain the given cluster ID, usageReporter drops the event.
+	ClusterIDCache *clusteridcache.Cache
+	InstallationID string
+}
+
+func (c *daemonUsageReporterConfig) CheckAndSetDefaults() error {
+	if c.ClientCache == nil {
+		return trace.BadParameter("missing ClientCache")
+	}
+
+	if c.EventConsumer == nil {
+		return trace.BadParameter("missing EventConsumer")
+	}
+
+	if c.ClusterIDCache == nil {
+		return trace.BadParameter("missing ClusterIDCache")
+	}
+
+	if c.InstallationID == "" {
+		return trace.BadParameter("missing InstallationID")
+	}
+
+	return nil
+}
+
+func newDaemonUsageReporter(cfg daemonUsageReporterConfig) (*daemonUsageReporter, error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	vnetConfigClient := clusterClient.AuthClient.VnetConfigServiceClient()
-	vnetConfig, err := vnetConfigClient.GetVnetConfig(ctx, &vnetproto.GetVnetConfigRequest{})
-	return vnetConfig, trace.Wrap(err)
+
+	return &daemonUsageReporter{
+		cfg:          cfg,
+		reportedApps: make(map[string]struct{}),
+		close:        make(chan struct{}),
+	}, nil
 }
+
+// ReportApp adds an event related to the given app to the events queue, if the app wasn't reported
+// already. Only one invocation of ReportApp can be in flight at a time.
+func (r *daemonUsageReporter) ReportApp(appURI uri.ResourceURI) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed.Load() {
+		return trace.CompareFailed("usage reporter has been stopped")
+	}
+
+	if _, hasAppBeenReported := r.reportedApps[appURI.String()]; hasAppBeenReported {
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-r.close:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	rootClusterURI := appURI.GetRootClusterURI()
+	client, err := r.cfg.ClientCache.GetCachedClient(ctx, appURI)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	rootClusterName := client.RootClusterName()
+	_, tc, err := r.cfg.ClientCache.ResolveClusterURI(appURI)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	clusterID, ok := r.cfg.ClusterIDCache.Load(rootClusterURI)
+	if !ok {
+		return trace.NotFound("cluster ID for %q not found", rootClusterURI)
+	}
+
+	log.DebugContext(ctx, "Reporting usage event", "app", appURI.String())
+
+	err = r.cfg.EventConsumer.ReportUsageEvent(&apiteleterm.ReportUsageEventRequest{
+		AuthClusterId: clusterID,
+		PrehogReq: &prehogv1alpha.SubmitConnectEventRequest{
+			DistinctId: r.cfg.InstallationID,
+			Timestamp:  timestamppb.Now(),
+			Event: &prehogv1alpha.SubmitConnectEventRequest_ProtocolUse{
+				ProtocolUse: &prehogv1alpha.ConnectProtocolUseEvent{
+					ClusterName:   rootClusterName,
+					UserName:      tc.Username,
+					Protocol:      "app",
+					Origin:        "vnet",
+					AccessThrough: "vnet",
+				},
+			},
+		},
+	})
+	if err != nil {
+		return trace.Wrap(err, "adding usage event to queue")
+	}
+
+	r.reportedApps[appURI.String()] = struct{}{}
+
+	return nil
+}
+
+// Stop aborts the reporting of an event that's currently in progress and prevents further events
+// from being reported. It blocks until the current ReportApp call aborts.
+func (r *daemonUsageReporter) Stop() {
+	if r.closed.Load() {
+		return
+	}
+
+	// Prevent new calls to ReportApp from being made.
+	r.closed.Store(true)
+	// Abort context of the ReportApp call currently in flight.
+	close(r.close)
+	// Block until the current ReportApp call aborts.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+}
+
+type disabledTelemetryUsageReporter struct{}
+
+func (r *disabledTelemetryUsageReporter) ReportApp(appURI uri.ResourceURI) error {
+	log.DebugContext(context.Background(), "Skipping usage event, usage reporting is turned off", "app", appURI.String())
+	return nil
+}
+
+func (r *disabledTelemetryUsageReporter) Stop() {}

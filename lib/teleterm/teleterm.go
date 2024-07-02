@@ -27,11 +27,13 @@ import (
 	"syscall"
 
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/gravitational/teleport/lib/teleterm/apiserver"
+	"github.com/gravitational/teleport/lib/teleterm/clusteridcache"
 	"github.com/gravitational/teleport/lib/teleterm/clusters"
 	"github.com/gravitational/teleport/lib/teleterm/daemon"
 )
@@ -47,13 +49,18 @@ func Serve(ctx context.Context, cfg Config) error {
 		return trace.Wrap(err)
 	}
 
+	clock := clockwork.NewRealClock()
+
 	storage, err := clusters.NewStorage(clusters.Config{
 		Dir:                cfg.HomeDir,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		Clock:              clock,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	clusterIDCache := &clusteridcache.Cache{}
 
 	daemonService, err := daemon.New(daemon.Config{
 		Storage:                         storage,
@@ -61,6 +68,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		PrehogAddr:                      cfg.PrehogAddr,
 		KubeconfigsDir:                  cfg.KubeconfigsDir,
 		AgentsDir:                       cfg.AgentsDir,
+		ClusterIDCache:                  clusterIDCache,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -72,6 +80,9 @@ func Serve(ctx context.Context, cfg Config) error {
 		Daemon:             daemonService,
 		TshdServerCreds:    grpcCredentials.tshd,
 		ListeningC:         cfg.ListeningC,
+		ClusterIDCache:     clusterIDCache,
+		InstallationID:     cfg.InstallationID,
+		Clock:              clock,
 	})
 	if err != nil {
 		return trace.Wrap(err)

@@ -33,8 +33,7 @@ type vnetCommand struct {
 
 func newVnetCommand(app *kingpin.Application) *vnetCommand {
 	cmd := &vnetCommand{
-		// TODO(nklaassen): unhide this when ready to ship.
-		CmdClause: app.Command("vnet", "Start Teleport VNet, a virtual network for TCP application access.").Hidden(),
+		CmdClause: app.Command("vnet", "Start Teleport VNet, a virtual network for TCP application access."),
 	}
 	return cmd
 }
@@ -45,7 +44,7 @@ func (c *vnetCommand) run(cf *CLIConf) error {
 		return trace.Wrap(err)
 	}
 
-	processManager, err := vnet.SetupAndRun(cf.Context, appProvider)
+	processManager, err := vnet.SetupAndRun(cf.Context, &vnet.SetupAndRunConfig{AppProvider: appProvider})
 	if err != nil {
 		return trace.Wrap(err)
 	}

@@ -660,9 +660,17 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_DatabaseUserDeactivate{
 			DatabaseUserDeactivate: e,
 		}
+	case *AccessPathChanged:
+		out.Event = &OneOf_AccessPathChanged{
+			AccessPathChanged: e,
+		}
 	case *SpannerRPC:
 		out.Event = &OneOf_SpannerRPC{
 			SpannerRPC: e,
+		}
+	case *DatabaseSessionCommandResult:
+		out.Event = &OneOf_DatabaseSessionCommandResult{
+			DatabaseSessionCommandResult: e,
 		}
 
 	default:
